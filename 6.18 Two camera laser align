@@ -1,0 +1,254 @@
+import sys
+import os
+import inspect
+import time
+import clr
+import numpy as np
+from pathlib import Path
+from System.Text import StringBuilder
+
+# Basler Pylon & OpenCV Imports
+from pypylon import pylon 
+import cv2
+
+print("Python %s\n" % sys.version)
+
+# --- NEWPORT DLL PATH CONFIGURATION ---
+strCurrFile = os.path.abspath(inspect.stack()[0][1])
+strPathDllFolder = os.path.dirname(strCurrFile)
+sys.path.append(strPathDllFolder)
+
+# Load Newport USB DLL wrapper
+clr.AddReference("UsbDllWrap")
+from Newport.USBComm import *
+
+# ==========================================
+# 1. IMAGE PROCESSING FUNCTIONS
+# ==========================================
+
+def find_iris_grid(image):
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+
+    gray = cv2.medianBlur(gray, 5)
+
+    circles = cv2.HoughCircles(
+        gray, 
+        cv2.HOUGH_GRADIENT, 
+        dp=1, 
+        minDist=100, 
+        param1=50, 
+        param2=30, 
+        minRadius=50, 
+        maxRadius=400
+    )
+
+    if circles is not None:
+        circles = np.uint16(np.around(circles))
+        first_circle = circles[0][0]
+        iris_x = int(first_circle[0])
+        iris_y = int(first_circle[1])
+        radius = int(first_circle[2])
+        
+        cv2.circle(image, (iris_x, iris_y), radius, (0, 255, 0), 2)
+        cv2.circle(image, (iris_x, iris_y), 5, (0, 0, 255), -1)
+        return iris_x, iris_y, radius  # Added returns missing from baseline block
+    return None, None, None
+        
+    
+def find_laser_center(image, iris_x=None, iris_y=None, radius=None):
+    if len(image.shape) == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = image.copy()
+        
+    if iris_x is not None and iris_y is not None and radius is not None:
+        mask = np.zeros_like(gray)
+        cv2.circle(mask, (iris_x, iris_y), int(radius - 15), 255, -1)
+        gray = cv2.bitwise_and(gray, mask)
+        
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray)
+    
+    if max_val < 200:
+        return None, None
+
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+    M = cv2.moments(thresh)
+    
+    if M["m00"] != 0: 
+        laser_x = int(M["m10"] / M["m00"])
+        laser_y = int(M["m01"] / M["m00"])
+    else:
+        laser_x = int(max_loc[0])
+        laser_y = int(max_loc[1])
+    
+    cv2.drawMarker(image, (laser_x, laser_y), (255, 0, 0), cv2.MARKER_CROSS, 20, 2)
+    return laser_x, laser_y
+
+
+# ==========================================
+# 2. HARDWARE CONTROL FUNCTIONS
+# ==========================================
+
+def move_motor_and_wait(oUSB, strDeviceKey, channel, steps):
+    """Sends a move command and blocks until the motor physically stops."""
+    if steps == 0:
+        return
+
+    strBldr = StringBuilder(128)
+    oUSB.Query(strDeviceKey, f"{channel}PR{steps}", strBldr)
+    
+    is_moving = True
+    while is_moving:
+        strBldr.Remove(0, strBldr.Length)
+        oUSB.Query(strDeviceKey, f"{channel}MD?", strBldr)
+        
+        if strBldr.ToString().strip() == "1":
+            is_moving = False
+        else:
+            time.sleep(0.02)
+
+
+# MODIFIED: Added channel_x and channel_y parameters to accept 1&2 or 3&4 dynamically
+def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, channel_x, channel_y):
+    """Translates pixel errors into physical relative movements."""
+    
+    STEPS_PER_PIXEL_X = -20.0  
+    STEPS_PER_PIXEL_Y = -20.0 
+    GAIN = 0.8 
+    MIN_STEPS = 15 
+
+    steps_x = int(delta_x * STEPS_PER_PIXEL_X * GAIN)
+    steps_y = int(delta_y * STEPS_PER_PIXEL_Y * GAIN)
+
+    if steps_x > 0 and steps_x < MIN_STEPS:
+        steps_x = MIN_STEPS
+    elif steps_x < 0 and steps_x > -MIN_STEPS:
+        steps_x = -MIN_STEPS
+
+    if steps_y > 0 and steps_y < MIN_STEPS:
+        steps_y = MIN_STEPS
+    elif steps_y < 0 and steps_y > -MIN_STEPS:
+        steps_y = -MIN_STEPS
+
+    # Process movements using passed target channels
+    if steps_x != 0:
+        print(f"  -> Channel {channel_x} moving {steps_x} steps...")
+        move_motor_and_wait(oUSB, strDeviceKey, channel_x, steps_x)
+        
+    if steps_y != 0:
+        print(f"  -> Channel {channel_y} moving {steps_y} steps...")
+        move_motor_and_wait(oUSB, strDeviceKey, channel_y, steps_y)
+
+
+# ==========================================
+# 3. MAIN EXECUTION LOOP
+# ==========================================
+
+def main():
+    ALIGNMENT_TOLERANCE_PX = 3 
+    
+    # --- INITIALIZE NEWPORT MOTORS ---
+    oUSB = USB(True)
+    if not oUSB.OpenDevices(0, True):
+        print("ERROR: Could not open Newport USB devices.")
+        sys.exit(1)
+        
+    try:
+        oDeviceTable = oUSB.GetDeviceTable()
+        if oDeviceTable.Count == 0:
+            print("No discovered Newport devices.")
+            sys.exit(1)
+            
+        oEnumerator = oDeviceTable.GetEnumerator()
+        oEnumerator.MoveNext()
+        strDeviceKey = str(oEnumerator.Key)
+        print("Connected Newport Controller:", strDeviceKey)
+
+        # --- MODIFIED: INITIALIZE BOTH BASLER CAMERAS ---
+        tl_factory = pylon.TlFactory.GetInstance()
+        devices = tl_factory.EnumerateDevices()
+        
+        if len(devices) < 2:
+            print(f"ERROR: Expected 2 cameras, found {len(devices)}.")
+            sys.exit(1)
+            
+        camera1 = pylon.InstantCamera(tl_factory.CreateDevice(devices[1]))
+        camera2 = pylon.InstantCamera(tl_factory.CreateDevice(devices[0]))
+        
+        camera1.Open()
+        camera2.Open()
+        print("Connected Camera 1:", camera1.GetDeviceInfo().GetModelName())
+        print("Connected Camera 2:", camera2.GetDeviceInfo().GetModelName())
+
+        for cam in [camera1, camera2]:
+            try:
+                cam.ExposureAuto.SetValue("Off")
+                cam.ExposureTime.SetValue(7000.0) 
+                cam.GainAuto.SetValue("Off")
+                cam.Gain.SetValue(0.0)
+            except Exception as e:
+                print(f"Warning: Could not set camera parameters: {e}")
+
+        # Start capturing profiles concurrently
+        camera1.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        camera2.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
+        
+        print("\n--- Starting Closed-Loop Hardware Initial Test ---")
+        print("Press 'q' in either window to exit.")
+        
+        while camera1.IsGrabbing() and camera2.IsGrabbing():
+            # Grab frame from Camera 1 (Iris #2 Setup)
+            grab1 = camera1.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+            # Grab frame from Camera 2 (Iris #1 Setup)
+            grab2 = camera2.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+
+            if grab1.GrabSucceeded() and grab2.GrabSucceeded():
+                # Process Camera 1 Image
+                raw_img1 = grab1.Array
+                img1 = cv2.cvtColor(raw_img1, cv2.COLOR_GRAY2BGR) if len(raw_img1.shape) == 2 else raw_img1.copy()
+                
+                # Process Camera 2 Image
+                raw_img2 = grab2.Array
+                img2 = cv2.cvtColor(raw_img2, cv2.COLOR_GRAY2BGR) if len(raw_img2.shape) == 2 else raw_img2.copy()
+                
+                # --- LIVE SELECTION ANCHORS (Run image processing scripts on both) ---
+                iris_x1, iris_y1, rad1 = find_iris_grid(img1)
+                find_laser_center(img1, iris_x1, iris_y1, rad1)
+
+                iris_x2, iris_y2, rad2 = find_iris_grid(img2)
+                find_laser_center(img2, iris_x2, iris_y2, rad2)
+
+                # Render both independent native desktop feeds 
+                cv2.imshow("Camera 1 - Iris 2 (Far Field)", img1)
+                cv2.imshow("Camera 2 - Iris 1 (Near Field)", img2)
+                
+                # Check for exit key
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
+            else:
+                print("One or both cameras dropped a frame. Retrying...")
+                
+            # Crucial: clean up both memory allocations
+            grab1.Release()
+            grab2.Release()
+
+        # Clean up both cameras cleanly
+        camera1.StopGrabbing()
+        camera2.StopGrabbing()
+        camera1.Close()
+        camera2.Close()
+        cv2.destroyAllWindows()
+
+    except KeyboardInterrupt:
+        print("\nProcess interrupted by user.")
+
+    finally:
+        oUSB.CloseDevices()
+        print("Newport Hardware Communication Closed Cleanly.")
+
+if __name__ == "__main__":
+    main()
