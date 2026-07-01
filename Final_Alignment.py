@@ -1,3 +1,7 @@
+# ==========================================
+# IMPORTS
+# ==========================================
+# Core libraries for file access, timing, math, and image processing.
 import sys
 import os
 import inspect
@@ -6,11 +10,13 @@ import numpy as np
 import cv2
 
 # --- Newport & Pylon Imports ---
+# Interfaces for Newport motor control and Basler camera acquisition.
 import clr
 from pypylon import pylon 
 from System.Text import StringBuilder
 
 # --- PyQt6 Imports ---
+# GUI widgets, signals, threads, and image display support.
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout,
     QHBoxLayout, QPushButton, QTabWidget, QToolButton, QDialog,
@@ -23,10 +29,12 @@ from PyQt6.QtGui import QImage, QPixmap
 # ==========================================
 # NEWPORT DLL CONFIGURATION
 # ==========================================
+# Add the local DLL folder so the Newport wrapper can be imported.
 strCurrFile = os.path.abspath(inspect.stack()[0][1])
 strPathDllFolder = os.path.dirname(strCurrFile)
 sys.path.append(strPathDllFolder)
 
+# Load the Newport USB communication wrapper.
 try:
     clr.AddReference("UsbDllWrap")
     from Newport.USBComm import *
@@ -36,43 +44,54 @@ except Exception as e:
 # ==========================================
 # 1. IMAGE & HARDWARE FUNCTIONS 
 # ==========================================
+
+# Detect the iris circle used as the optical reference point.
 def find_iris_grid(image):
+    # Convert frame to grayscale for circle detection.
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image.copy()
 
+    # Reduce noise and apply Hough Circle Transform.
     gray = cv2.medianBlur(gray, 5)
     circles = cv2.HoughCircles(
         gray, cv2.HOUGH_GRADIENT, dp=1, minDist=100, 
         param1=50, param2=30, minRadius=50, maxRadius=400
     )
 
+    # Use the first detected circle as the iris candidate.
     if circles is not None:
         circles = np.uint16(np.around(circles))
         first_circle = circles[0][0]
         iris_x, iris_y, radius = int(first_circle[0]), int(first_circle[1]), int(first_circle[2])
         
+        # Draw iris overlay for operator feedback.
         cv2.circle(image, (iris_x, iris_y), radius, (0, 255, 0), 2)
         cv2.circle(image, (iris_x, iris_y), 5, (0, 0, 255), -1)
         return iris_x, iris_y, radius
     return None, None, None
 
+# Finds the laser centroid used to compute alignment error.
 def find_laser_center(image, iris_x=None, iris_y=None, radius=None):
+    # Convert frame to grayscale for intensity processing.
     if len(image.shape) == 3:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     else:
         gray = image.copy()
         
+    # Limit the search to the iris aperture when available.
     if iris_x is not None and iris_y is not None and radius is not None:
         mask = np.zeros_like(gray)
         cv2.circle(mask, (iris_x, iris_y), int(radius - 15), 255, -1)
         gray = cv2.bitwise_and(gray, mask)
         
+    # Reject frames where the beam is too dim to track reliably.
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(gray)
     
     if max_val < 200: return None, None
 
+    # Threshold the beam and calculate its centroid.
     _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
     M = cv2.moments(thresh)
     
@@ -81,14 +100,17 @@ def find_laser_center(image, iris_x=None, iris_y=None, radius=None):
     else:
         laser_x, laser_y = int(max_loc[0]), int(max_loc[1])
     
+    # Mark the detected beam position on the display image.
     cv2.drawMarker(image, (laser_x, laser_y), (255, 0, 0), cv2.MARKER_CROSS, 40, 2)
     return laser_x, laser_y
 
+# Sends a relative move command to one motor channel.
 def move_motor_no_wait(oUSB, strDeviceKey, channel, steps):
     if steps == 0: return
     strBldr = StringBuilder(128)
     oUSB.Query(strDeviceKey, f"{channel}PR{steps}", strBldr)
 
+# Stops the two motor channels assigned to one mirror mount.
 def stop_motors(oUSB, strDeviceKey, ch1, ch2):
     strBldr = StringBuilder(128)
     try:
@@ -96,6 +118,7 @@ def stop_motors(oUSB, strDeviceKey, ch1, ch2):
         oUSB.Query(strDeviceKey, f"{ch2}ST", strBldr)
     except: pass
 
+# Converts camera error into motor steps for the selected actuator.
 def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num):
     error_distance = max(abs(delta_x), abs(delta_y))
 
@@ -106,6 +129,7 @@ def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num
     elif actuator_num == 2 and error_distance <= 12:
         return 0.0
 
+    # Select gain and motion limits based on error magnitude.
     if error_distance < 15:
         GAIN = 0.5
         MIN_STEPS = 1
@@ -119,6 +143,7 @@ def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num
         MIN_STEPS = 15  
         MAX_STEPS = 600  
 
+    # Map the actuator number to motor channels and calibration signs.
     if actuator_num == 1:
         CH_X, CH_Y = 1, 2
         STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y = 20.0, -20.0
@@ -127,9 +152,11 @@ def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num
         STEPS_PER_PIXEL_X, STEPS_PER_PIXEL_Y = -2.0, -2.0
         MAX_STEPS = min(MAX_STEPS, 4)
 
+    # Convert pixel error to motor steps.
     steps_x = int(delta_x * STEPS_PER_PIXEL_X * GAIN)
     steps_y = int(delta_y * STEPS_PER_PIXEL_Y * GAIN)
 
+    # Clamp motor steps to reduce stalling and overshoot.
     if 0 < steps_x < MIN_STEPS: steps_x = MIN_STEPS
     elif 0 > steps_x > -MIN_STEPS: steps_x = -MIN_STEPS
     elif steps_x > MAX_STEPS: steps_x = MAX_STEPS
@@ -140,6 +167,7 @@ def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num
     elif steps_y > MAX_STEPS: steps_y = MAX_STEPS
     elif steps_y < -MAX_STEPS: steps_y = -MAX_STEPS
 
+    # Send nonzero movement commands to the hardware.
     if steps_x != 0: move_motor_no_wait(oUSB, strDeviceKey, CH_X, steps_x)
     if steps_y != 0: move_motor_no_wait(oUSB, strDeviceKey, CH_Y, steps_y)
 
@@ -149,12 +177,15 @@ def adjust_hardware_alignment(oUSB, strDeviceKey, delta_x, delta_y, actuator_num
 # ==========================================
 # 2. THE HARDWARE THREAD (The Bridge)
 # ==========================================
+# Runs camera acquisition, image processing, and motor control off the GUI thread.
 class HardwareThread(QThread):
+    # Signals send frames, logs, status, and laser coordinates to the GUI.
     frame_ready = pyqtSignal(int, np.ndarray)  
     log_msg = pyqtSignal(str)                  
     status_msg = pyqtSignal(str)               
     laser_pos_update = pyqtSignal(int, int, int) 
 
+    # Initializes alignment state, manual target state, and image saving settings.
     def __init__(self):
         super().__init__()
         self.is_running = True
@@ -176,10 +207,15 @@ class HardwareThread(QThread):
         self.cam1_stable_count = 0
         self.cam2_stable_count = 0
         
+        self.cam1_drift_count = 0
+        self.cam2_drift_cont = 0
+        self.system_locked_stop_sent = False
+        
         self.save_images = False
         self.save_interval = 3
         self.last_save_time = time.time()
 
+    # Applies exposure and gain settings to both cameras.
     def update_camera_settings(self, exposure, gain):
         if hasattr(self, 'cameras') and self.cameras.IsOpen():
             for i, cam in enumerate(self.cameras):
@@ -193,6 +229,7 @@ class HardwareThread(QThread):
                     except: pass
             self.log_msg.emit(f"Hardware updated: Exposure={exposure}, Gain={gain}")
 
+    # Starts a manual move toward a clicked camera target.
     def execute_manual_move(self, cam_idx, x, y):
         self.is_aligning = False 
         self.manual_target_active = True
@@ -200,17 +237,23 @@ class HardwareThread(QThread):
         self.manual_x = x
         self.manual_y = y
 
+    # Cancels active alignment modes and holds motor position.
     def stop_all_movement(self):
         self.is_aligning = False
         self.manual_target_active = False
         self.status_msg.emit("All movement stopped. Holding position.")
 
+    # Main hardware loop for USB setup, camera acquisition, and alignment control.
     def run(self):
         # --- SPLIT TOLERANCES ---
-        CAM1_TOLERANCE_PX = 4  
+        CAM1_TOLERANCE_PX = 10  
         CAM2_TOLERANCE_PX = 12  
-        DRIFT_TOLERANCE_PX = 20 # Bumped slightly so normal noise doesn't instantly wake it up
+        DRIFT_TOLERANCE_PX = 22 # Bumped slightly so normal noise doesn't instantly wake it up
         
+        STABLE_FRAMES_REQUIRED = 5
+        DRIFT_FRAMES_REQUIRED = 5
+
+        # Initialize Newport USB controller.
         try:
             self.oUSB = USB(True)
             if not self.oUSB.OpenDevices(0, True):
@@ -225,12 +268,14 @@ class HardwareThread(QThread):
             self.log_msg.emit(f"Hardware init skipped or failed: {e}")
             return
 
+        # Initialize and configure the two Basler cameras.
         try:
             tlFactory = pylon.TlFactory.GetInstance()
             devices = tlFactory.EnumerateDevices()
             CAM1_SN = "25191527" 
             CAM2_SN = "25191524" 
             
+            # Match detected devices to the expected serial numbers.
             self.cameras = pylon.InstantCameraArray(2)
             cam1_found, cam2_found = False, False
             for dev in devices:
@@ -248,6 +293,7 @@ class HardwareThread(QThread):
                 self.log_msg.emit("ERROR: Could not find both cameras!")
                 return
 
+            # Disable auto settings and apply fixed acquisition parameters.
             self.cameras.Open()
             for i, cam in enumerate(self.cameras):
                 try: cam.ExposureAuto.SetValue("Off")
@@ -270,13 +316,16 @@ class HardwareThread(QThread):
                     try: cam.AcquisitionFrameRateAbs.SetValue(30.0)
                     except: pass
 
+            # Start acquisition using the most recent frame from each camera.
             self.cameras.StartGrabbing(pylon.GrabStrategy_LatestImageOnly, pylon.GrabLoop_ProvidedByUser)
             self.log_msg.emit("Cameras started at 30 FPS. Waiting for frames...")
             latest_frames = {0: None, 1: None}
 
+            # Continuous acquisition and alignment loop.
             while self.is_running and self.cameras.IsGrabbing():
                 grab_result = self.cameras.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
 
+                # Store the latest frame from whichever camera returned data.
                 if grab_result.GrabSucceeded():
                     cam_idx = grab_result.GetCameraContext()
                     raw_image = grab_result.Array
@@ -284,9 +333,11 @@ class HardwareThread(QThread):
                     latest_frames[cam_idx] = image
                 grab_result.Release()
 
+                # Process only when a synchronized pair of frames is available.
                 if latest_frames[0] is not None and latest_frames[1] is not None:
                     img1, img2 = latest_frames[0], latest_frames[1]
 
+                    # Detect iris and laser position for Camera 1.
                     i1_x, i1_y, r1 = find_iris_grid(img1)
                     l1_x, l1_y = find_laser_center(img1, i1_x, i1_y, r1)
                     err1_x, err1_y = 0, 0
@@ -295,6 +346,7 @@ class HardwareThread(QThread):
                         err1_x, err1_y = l1_x - i1_x, l1_y - i1_y
                         cv2.line(img1, (i1_x, i1_y), (l1_x, l1_y), (0, 255, 255), 2)
 
+                    # Detect iris and laser position for Camera 2.
                     i2_x, i2_y, r2 = find_iris_grid(img2)
                     l2_x, l2_y = find_laser_center(img2, i2_x, i2_y, r2)
                     err2_x, err2_y = 0, 0
@@ -303,12 +355,51 @@ class HardwareThread(QThread):
                         err2_x, err2_y = l2_x - i2_x, l2_y - i2_y
                         cv2.line(img2, (i2_x, i2_y), (l2_x, l2_y), (0, 255, 255), 2)
                         
+                    # Compute pixel error for convergence checks.
                     err_dist1 = max(abs(err1_x), abs(err1_y)) if l1_x is not None else 999
                     err_dist2 = max(abs(err2_x), abs(err2_y)) if l2_x is not None else 999
 
+                    err_pct1 = 0.0
+                    err_pct2 = 0.0
+
+                    # Express alignment error as a percentage of iris radius.
+                    if r1 is not None and r1 > 0:
+                        err_mag1 = (err1_x ** 2 + err1_y ** 2) ** 0.5
+                        err_pct1 = (err_mag1 / r1) * 100
+
+                    if r2 is not None and r2 > 0:
+                        err_mag2 = (err2_x ** 2 + err2_y ** 2) ** 0.5
+                        err_pct2 = (err_mag2 / r2) * 100
+
+                    # Automatic alignment state machine.
                     if self.is_aligning:
+                        # Once locked, stop motors and monitor for drift.
                         if self.cam1_locked and self.cam2_locked:
-                            if time.time() > self.sentry_timer:
+                            if not self.system_locked_stop_sent:
+                                stop_motors(self.oUSB, self.strDeviceKey, 1, 2)
+                                stop_motors(self.oUSB, self.strDeviceKey, 3, 4)
+                                self.system_locked_stop_sent = True
+                                self.log_msg.emit("System aligned. Motors stopped; monitoring for drift.")
+
+                            if err_dist1 > DRIFT_TORLERANCE_PX:
+                                self.cam1_drift_count += 1
+                            else:
+                                self.cam1_drift_count = 0
+
+                            if self.cam1_drift_count >= DRIFT_FRAMES_REQUIRED:
+                                self.cam1_locked = False
+                                self.cam1_stable_count = 0
+                                self.cam1_drift_count = 0
+                                self.system_locked_stop_sent = False
+                                self.log_msg.emit("Camera 1 drift detected. Re-aligning actuator 1.")
+
+                            if self.cam2_drift_count >= DRIFT_FRAMES_REQUIRED:
+                                self.cam2_locked = False
+                                self.cam2_stable_count = 0
+                                self.cam2_drift_count = 0
+                                self.system_locked_stop_sent = False
+                                self.log_msg.emit("Camera 2 drift detected. Re-aligning actuator 2.")
+ 
                                 drift_detected = False
                                 
                                 if err_dist1 > DRIFT_TOLERANCE_PX:
@@ -325,6 +416,7 @@ class HardwareThread(QThread):
                                     
                                 self.sentry_timer = time.time() + 3.0
                         else:
+                            # Update lock state for each camera before moving motors.
                             if self.cam1_locked:
                                 if err_dist1 > DRIFT_TOLERANCE_PX:
                                     self.cam1_locked = False
@@ -332,7 +424,7 @@ class HardwareThread(QThread):
                             else:
                                 if err_dist1 <= CAM1_TOLERANCE_PX:
                                     self.cam1_stable_count += 1
-                                    if self.cam1_stable_count >= 3:
+                                    if self.cam1_stable_count >= STABLE_FRAMES_REQUIRED:
                                         self.cam1_locked = True
                                         stop_motors(self.oUSB, self.strDeviceKey, 1, 2)
                                         self.alignment_cooldown = time.time() + 0.5 
@@ -346,7 +438,7 @@ class HardwareThread(QThread):
                             else:
                                 if err_dist2 <= CAM2_TOLERANCE_PX:
                                     self.cam2_stable_count += 1
-                                    if self.cam2_stable_count >= 3:
+                                    if self.cam2_stable_count >= STABLE_FRAMES_REQUIRED:
                                         self.cam2_locked = True
                                         stop_motors(self.oUSB, self.strDeviceKey, 3, 4)
                                         self.alignment_cooldown = time.time() + 0.5 
@@ -356,6 +448,7 @@ class HardwareThread(QThread):
                             if self.cam1_locked and self.cam2_locked:
                                 self.sentry_timer = time.time() + 3.0
 
+                        # Select the active alignment action and update overlays.
                         new_status = "" 
                         if l1_x is None:
                             cv2.putText(img1, "BEAM LOST", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
@@ -364,15 +457,25 @@ class HardwareThread(QThread):
                             cv2.putText(img1, "ALIGNING M1", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
                             new_status = "Aligning Camera 1..."
                             if time.time() > self.alignment_cooldown:
-                                self.log_msg.emit(f"Cam 1 Pos: X={l1_x}, Y={l1_y} | Error: dX={err1_x}, dY={err1_y} -> Adjusting...")
+                                self.log_msg.emit(
+                                    f"Aligning Camera 1 | Beam: X= {l1_x}, Y={l1_y} | "
+                                    f"dX={err1_x}px, dY={err1_y}px | Error={err_pct1:.2f}%"
+                                )
+
                                 cooldown = adjust_hardware_alignment(self.oUSB, self.strDeviceKey, err1_x, err1_y, 1)
                                 self.alignment_cooldown = time.time() + cooldown
+                        
                         elif self.cam1_locked and not self.cam2_locked:
                             cv2.putText(img1, "M1 LOCKED", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
                             cv2.putText(img2, "ALIGNING M2", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 165, 255), 3)
                             new_status = "Camera 1 Locked. Aligning Camera 2..."
                             if time.time() > self.alignment_cooldown:
-                                self.log_msg.emit(f"Cam 2 Pos: X={l2_x}, Y={l2_y} | Error: dX={err2_x}, dY={err2_y} -> Adjusting...")
+                                
+                                self.log_msg.emit(
+                                    f"Aligning Camera 2 | Beam: X={l2_x}, Y={l2_y} | "
+                                    f"dX={err2_x}px, dY={err2_y}px | Error={err_pct2:.2f}%"
+                                )
+                                
                                 cooldown = adjust_hardware_alignment(self.oUSB, self.strDeviceKey, err2_x, err2_y, 2)
                                 self.alignment_cooldown = time.time() + cooldown
                         elif self.cam1_locked and self.cam2_locked:
@@ -385,9 +488,11 @@ class HardwareThread(QThread):
                             self.status_msg.emit(new_status)
                             self.current_status = new_status
                             
+                    # Manual target mode uses a clicked point instead of the iris center.
                     elif self.manual_target_active:
                         new_status = ""
                         
+                        # Move actuator 1 toward a Camera 1 target.
                         if self.manual_cam_idx == 0:
                             if l1_x is None:
                                 cv2.putText(img1, "BEAM LOST", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
@@ -412,6 +517,7 @@ class HardwareThread(QThread):
                                         cooldown = adjust_hardware_alignment(self.oUSB, self.strDeviceKey, err_x, err_y, 1)
                                         self.alignment_cooldown = time.time() + cooldown
                                         
+                        # Move actuator 2 toward a Camera 2 target.
                         elif self.manual_cam_idx == 1:
                             if l2_x is None:
                                 cv2.putText(img2, "BEAM LOST", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 3)
@@ -441,6 +547,7 @@ class HardwareThread(QThread):
                             self.current_status = new_status
 
                     else:
+                        # Stop motors when leaving an active movement mode.
                         if self.was_aligning or self.was_manual_aligning:
                             stop_motors(self.oUSB, self.strDeviceKey, 1, 2)
                             stop_motors(self.oUSB, self.strDeviceKey, 3, 4)
@@ -448,12 +555,14 @@ class HardwareThread(QThread):
                     self.was_aligning = self.is_aligning
                     self.was_manual_aligning = self.manual_target_active
 
+                    # Save annotated camera frames at the selected interval.
                     if self.save_images and (time.time() - self.last_save_time >= self.save_interval):
                         cv2.imwrite(f"cam1_{int(time.time())}.png", img1)
                         cv2.imwrite(f"cam2_{int(time.time())}.png", img2)
                         self.log_msg.emit("Images saved to disk.")
                         self.last_save_time = time.time()
 
+                    # Push processed frames to the GUI.
                     self.frame_ready.emit(0, img1)
                     self.frame_ready.emit(1, img2)
                     latest_frames = {0: None, 1: None} 
@@ -461,6 +570,7 @@ class HardwareThread(QThread):
         except Exception as e:
             self.log_msg.emit(f"Camera Loop Error: {e}")
 
+    # Stops acquisition and closes hardware connections.
     def stop(self):
         self.is_running = False
         self.wait() 
@@ -473,9 +583,12 @@ class HardwareThread(QThread):
 # ==========================================
 # 3. GUI CLASSES
 # ==========================================
+
+# QLabel subclass that displays a camera feed and reports click coordinates.
 class ClickableCameraView(QLabel):
     clicked = pyqtSignal(str, int, int)
 
+    # Sets up the camera display widget.
     def __init__(self, camera_name):
         super().__init__()
         self.camera_name = camera_name
@@ -484,11 +597,13 @@ class ClickableCameraView(QLabel):
         self.setMinimumSize(350, 300)
         self.setStyleSheet("background-color: black; color: white; border: 2px solid gray; font-size: 16px;")
 
+    # Emits the clicked image location for manual targeting.
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             x, y = int(event.position().x()), int(event.position().y())
             self.clicked.emit(self.camera_name, x, y)
 
+    # Converts an OpenCV frame into a scaled Qt pixmap.
     def update_image(self, cv_img):
         rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb_image.shape
@@ -497,7 +612,10 @@ class ClickableCameraView(QLabel):
         pixmap = QPixmap.fromImage(qt_image)
         self.setPixmap(pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
+# Dialog for image saving and camera acquisition settings.
 class SettingsDialog(QDialog):
+
+    # Builds the settings form and confirmation buttons.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Settings")
@@ -528,7 +646,10 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
         self.setLayout(layout)
 
+# Main GUI window for camera viewing, controls, and hardware status.
 class AlignerApp(QMainWindow):
+
+    # Initializes the GUI and starts the hardware thread.
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Laser Alignment System")
@@ -553,12 +674,6 @@ class AlignerApp(QMainWindow):
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
         
-        settings_button = QToolButton()
-        settings_button.setText("⚙")
-        settings_button.setToolTip("Settings")
-        settings_button.clicked.connect(self.open_settings)
-        self.tabs.setCornerWidget(settings_button, Qt.Corner.TopRightCorner)
-
         self.tabs.addTab(self.create_camera_tab(), "Cameras")
         self.tabs.addTab(self.create_logs_tab(), "Logs")
 
@@ -575,6 +690,7 @@ class AlignerApp(QMainWindow):
         self.log("App started.")
         self.set_status_message("Cameras warming up...")
 
+    # Creates the live camera display tab.
     def create_camera_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
@@ -608,6 +724,7 @@ class AlignerApp(QMainWindow):
         layout.addLayout(camera_row)
         return tab
 
+    # Creates the system log tab.
     def create_logs_tab(self):
         tab = QWidget()
         layout = QVBoxLayout()
@@ -617,6 +734,7 @@ class AlignerApp(QMainWindow):
         layout.addWidget(self.log_box)
         return tab
 
+    # Creates the right-side alignment control panel.
     def create_alignment_panel(self):
         panel = QFrame()
         panel.setFixedWidth(280)
@@ -644,17 +762,14 @@ class AlignerApp(QMainWindow):
         layout.addWidget(start_btn)
         layout.addWidget(stop_btn)
 
-        self.exposure_label = QLabel()
-        self.gain_label = QLabel()
         self.save_images_label = QLabel()
-        layout.addWidget(self.exposure_label)
-        layout.addWidget(self.gain_label)
         layout.addWidget(self.save_images_label)
         self.update_settings_display()
 
         layout.addStretch()
         return panel
 
+    # Opens the settings dialog and applies accepted changes.
     def open_settings(self):
         dialog = SettingsDialog()
         dialog.save_images_checkbox.setChecked(self.save_images)
@@ -674,15 +789,18 @@ class AlignerApp(QMainWindow):
             self.hw_thread.save_interval = self.save_interval
             self.hw_thread.update_camera_settings(self.exposure_time, self.gain)
 
+    # Routes incoming frames to the correct camera widget.
     def display_camera_frame(self, cam_index, img_data):
         if cam_index == 0: self.cam1_view.update_image(img_data)
         elif cam_index == 1: self.cam2_view.update_image(img_data)
 
+    # Updates the displayed laser coordinate.
     def update_current_position(self, cam_idx, x, y):
         self.current_x = x
         self.current_y = y
         self.update_position_display(f"Camera {cam_idx + 1}")
 
+    # Stores a clicked target point for manual alignment.
     def set_target_position(self, camera_name, x, y):
         self.target_camera = camera_name
         self.target_x = x
@@ -690,6 +808,7 @@ class AlignerApp(QMainWindow):
         self.update_target_display()
         self.set_status_message(f"Target selected on {camera_name}: X={x}, Y={y}")
 
+    # Commands the hardware thread to move toward the selected target.
     def go_to_target(self):
         if self.target_x is None:
             self.set_status_message("Select a target first!")
@@ -702,46 +821,66 @@ class AlignerApp(QMainWindow):
         
         self.hw_thread.execute_manual_move(cam_idx, self.target_x, self.target_y)
 
+    # Refreshes the current-position label.
     def update_position_display(self, active_cam="None"):
         self.current_position_label.setText(f"Laser Tracking ({active_cam}):\nX = {self.current_x}\nY = {self.current_y}")
 
+    # Refreshes the selected-target label.
     def update_target_display(self):
         if self.target_x is None:
             self.target_position_label.setText("Target position:\nNone selected")
         else:
             self.target_position_label.setText(f"Target position ({self.target_camera}):\nX = {self.target_x}\nY = {self.target_y}")
 
+    # Refreshes the image-saving status label.
     def update_settings_display(self):
-        self.exposure_label.setText(f"Exposure: {self.exposure_time} ms")
-        self.gain_label.setText(f"Gain: {self.gain}")
         if self.save_images:
             self.save_images_label.setText(f"Save images: ON ({self.save_interval}s)")
         else:
             self.save_images_label.setText("Save images: OFF")
 
+    # Resets lock states and starts automatic alignment.
     def start_alignment(self):
-        self.hw_thread.manual_target_active = False 
+        self.hw_thread.manual_target_active = False
         self.hw_thread.is_aligning = True
-        self.set_status_message("Auto-Alignment Running...")
+
+        self.hw_thread.cam1_locked = False
+        self.hw_thread.cam2_locked = False
+        self.hw_thread.cam1_stable_count = 0
+        self.hw_thread.cam2_stable_count = 0
+        self.hw_thread.cam1_drift_count = 0
+        self.hw_thread.cam2_drift_count = 0
+        self.hw_thread.system_locked_stop_sent = False
+        self.hw_thread.alignment_cooldown = 0.0
+
+        self.set_status_message("Auto-alignment Running...")
         self.log("Started alignment algorithm.")
 
+    # Stops active alignment and motor motion.
     def stop_alignment(self):
         self.hw_thread.stop_all_movement()
         self.log("Stopped all alignment and halted motors.")
 
+    # Updates the top status message.
     def set_status_message(self, msg):
         self.camera_status_label.setText(msg)
 
+    # Writes a message to both the GUI log and terminal.
     def log(self, msg):
         if hasattr(self, "log_box"):
             self.log_box.append(msg)
         print(msg)
 
+    # Ensures hardware is closed before the GUI exits.
     def closeEvent(self, event):
         self.log("Shutting down hardware cleanly...")
         self.hw_thread.stop()
         event.accept()
 
+# ==========================================
+# PROGRAM ENTRY POINT
+# ==========================================
+# Starts the Qt application and displays the main window.
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = AlignerApp()
