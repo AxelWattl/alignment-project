@@ -119,7 +119,7 @@ IRIS_INITIALIZATION = {
 def create_iris_mask(
     image,
     camera_index=0,
-    debug=True,
+    debug=False,
 ):
     if image.ndim == 3:
         gray = cv2.cvtColor(
@@ -451,7 +451,7 @@ def find_iris_grid(
     mask, offset = create_iris_mask(
         image,
         camera_index=camera_index,
-        debug=True,
+        debug=False,
     )
 
     return find_iris_from_mask(
@@ -635,8 +635,8 @@ def adjust_hardware_alignment(
         tolerance_x = 12
         tolerance_y = 12
 
-        max_steps_x = 4
-        max_steps_y = 4
+        max_steps_x = 50
+        max_steps_y = 50
 
     else:
         raise ValueError("actuator_num must be 1 or 2")
