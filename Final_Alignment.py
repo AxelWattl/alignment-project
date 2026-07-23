@@ -1,3 +1,9 @@
+#TODO: save function needs to be tested and checked.
+#TODO: calibrate each iris/camera
+#TODO: something that allows the controllers to stop at physical limits
+#TODO: more robust iris detection software
+#TODO: more robust laser detection software
+
 # ==========================================
 # IMPORTS
 # ==========================================
@@ -30,15 +36,31 @@ from PyQt6.QtGui import QImage, QPixmap
 #Default Camera Settings
 CAMERA_SETTINGS = {
     0: {
-        "exposure": 50000.0,
+        "exposure": 30000.0,
         "gain": 0.0,
     },
     1: {
-        "exposure": 50000.0,
+        "exposure": 100000.0,
         "gain": 0.0,
     },
 }
-
+IRIS_DETECTION_SETTINGS = {
+    0: {
+        "target_radius": 360,
+        "minimum_radius": 300,
+        "maximum_radius": 430,
+    },
+    1: {
+        "target_radius": 420,
+        "minimum_radius": 350,
+        "maximum_radius": 500,
+    },
+}
+IRIS_ROI = {
+    # x1, y1, x2, y2 in raw camera coordinates
+    0: None,
+    1: None,
+}
 
 # ==========================================
 # NEWPORT DLL CONFIGURATION
@@ -82,11 +104,6 @@ except Exception as e:
 # ==========================================
 # 1. IMAGE & HARDWARE FUNCTIONS 
 # ==========================================
-IRIS_ROI = {
-    # x1, y1, x2, y2 in raw camera coordinates
-    0: None,
-    1: None,
-}
 def remove_illumination_background(gray):
     background = cv2.GaussianBlur(
         gray,
@@ -482,7 +499,7 @@ def find_laser_center(
         mask = np.zeros_like(gray)
 
         search_radius = max(
-            int(radius - 15),
+            int(radius * 0.75),
             1,
         )
 
@@ -720,13 +737,54 @@ class HardwareThread(QThread):
         self.is_aligning = False  
         self.was_aligning = False
         self.alignment_cooldown = 0.0 
-        
-        self.pid_m1_x = PIDController(kp=1.0, ki=0.0, kd=0.0)
-        self.pid_m1_y = PIDController(kp=1.0, ki=0.0, kd=0.0)
 
-        self.pid_m2_x = PIDController(kp=0.5, ki=0.0, kd=0.0)
-        self.pid_m2_y = PIDController(kp=0.5, ki=0.0, kd=0.0)
+         # Iris calibration state.
+        self.iris_samples = {
+            0: [],
+            1: [],
+        }
 
+        self.fixed_iris = {
+            0: None,
+            1: None,
+        }
+        self.iris_mask_radius = {
+            0: 350,
+            1: 350,
+        }
+
+        self.iris_calibration_frames = 30
+
+
+        # Mirror 1 PID gains
+        self.pid_m1_x = PIDController(
+            kp=1.0,
+            ki=0.02,
+            kd=0.00,
+            integral_limit=300.0,
+        )
+
+        self.pid_m1_y = PIDController(
+            kp=1.0,
+            ki=0.02,
+            kd=0.00,
+            integral_limit=300.0,
+        )
+
+        # Mirror 2 PID gains
+        self.pid_m2_x = PIDController(
+            kp=0.75,
+            ki=0.01,
+            kd=0.00,
+            integral_limit=300.0,
+        )
+
+        self.pid_m2_y = PIDController(
+            kp=0.75,
+            ki=0.01,
+            kd=0.00,
+            integral_limit=300.0,
+        )
         self.last_pid_time_m1 = None
         self.last_pid_time_m2 = None
 
@@ -751,6 +809,73 @@ class HardwareThread(QThread):
         self.save_images = False
         self.save_interval = 3
         self.last_save_time = time.time()
+
+    def recalibrate_irises(self):
+        # Stop alignment while recalibrating.
+        self.is_aligning = False
+
+        # Stop both mirror pairs immediately.
+        try:
+            stop_motors(
+                self.oUSB,
+                self.strDeviceKey,
+                1,
+                2,
+            )
+
+            stop_motors(
+                self.oUSB,
+                self.strDeviceKey,
+                3,
+                4,
+            )
+
+        except Exception as exc:
+            self.log_msg.emit(
+                f"Motor stop during recalibration failed: {exc}"
+            )
+
+        # Clear frozen iris calibration.
+        self.fixed_iris = {
+            0: None,
+            1: None,
+        }
+
+        self.iris_samples = {
+            0: [],
+            1: [],
+        }
+
+        self.previous_iris = {
+            0: None,
+            1: None,
+        }
+
+        # Clear alignment lock state.
+        self.cam1_locked = False
+        self.cam2_locked = False
+
+        self.cam1_stable_count = 0
+        self.cam2_stable_count = 0
+
+        self.cam1_drift_count = 0
+        self.cam2_drift_count = 0
+
+        self.system_locked_stop_sent = False
+
+        # Clear PID state.
+        self.pid_m1_x.reset()
+        self.pid_m1_y.reset()
+        self.pid_m2_x.reset()
+        self.pid_m2_y.reset()
+
+        self.last_pid_time_m1 = None
+        self.last_pid_time_m2 = None
+
+        self.log_msg.emit(
+            "Iris calibration cleared. "
+            "Searching for new iris centers..."
+        )
 
     def get_pid_dt(self, actuator_num):
         now = time.monotonic()
@@ -780,6 +905,140 @@ class HardwareThread(QThread):
 
         self.last_pid_time_m1 = None
         self.last_pid_time_m2 = None
+
+    def update_iris_center_calibration(
+        self,
+        camera_index,
+        detected_circle,
+    ):
+        if self.fixed_iris_center[camera_index] is not None:
+            return self.fixed_iris_center[camera_index]
+
+        if detected_circle is None:
+            return None
+
+        iris_x, iris_y, radius = detected_circle
+
+        self.iris_center_samples[camera_index].append(
+            (float(iris_x), float(iris_y))
+        )
+
+        if len(self.iris_center_samples[camera_index]) < (
+            self.iris_calibration_frames
+        ):
+            return int(iris_x), int(iris_y)
+
+        samples = np.asarray(
+            self.iris_center_samples[camera_index],
+            dtype=np.float32,
+        )
+
+        median_x = float(np.median(samples[:, 0]))
+        median_y = float(np.median(samples[:, 1]))
+
+        distances = np.sqrt(
+            (samples[:, 0] - median_x) ** 2
+            + (samples[:, 1] - median_y) ** 2
+        )
+
+        # Discard detections far from the median center.
+        inliers = samples[distances <= 20.0]
+
+        if len(inliers) < 15:
+            self.iris_center_samples[camera_index].clear()
+            return int(iris_x), int(iris_y)
+
+        fixed_x = int(round(np.median(inliers[:, 0])))
+        fixed_y = int(round(np.median(inliers[:, 1])))
+
+        self.fixed_iris_center[camera_index] = (
+            fixed_x,
+            fixed_y,
+        )
+
+        self.log_msg.emit(
+            f"Camera {camera_index + 1} iris center fixed at "
+            f"({fixed_x}, {fixed_y})"
+        )
+
+        return self.fixed_iris_center[camera_index]
+    
+    def update_iris_calibration(
+        self,
+        camera_index,
+        detected_circle,
+    ):
+        if self.fixed_iris[camera_index] is not None:
+            return self.fixed_iris[camera_index]
+        if detected_circle is None:
+            return None
+
+        # Once calibrated, always use the fixed reference.
+        if self.fixed_iris[camera_index] is not None:
+            return self.fixed_iris[camera_index]
+
+        iris_x, iris_y, radius = detected_circle
+
+        self.iris_samples[camera_index].append(
+            (
+                int(iris_x),
+                int(iris_y),
+                int(radius),
+            )
+        )
+
+        # Keep only the most recent samples.
+        if len(self.iris_samples[camera_index]) > (
+            self.iris_calibration_frames
+        ):
+            self.iris_samples[camera_index].pop(0)
+
+        if len(self.iris_samples[camera_index]) < (
+            self.iris_calibration_frames
+        ):
+            return detected_circle
+
+        samples = np.asarray(
+            self.iris_samples[camera_index],
+            dtype=np.float32,
+        )
+
+        # Median is resistant to occasional wrong contours.
+        median_x = int(np.median(samples[:, 0]))
+        median_y = int(np.median(samples[:, 1]))
+        median_radius = int(np.median(samples[:, 2]))
+
+        # Check that the calibration samples are sufficiently stable.
+        center_spread = np.max(
+            np.sqrt(
+                (samples[:, 0] - median_x) ** 2
+                + (samples[:, 1] - median_y) ** 2
+            )
+        )
+
+        radius_spread = np.max(
+            np.abs(samples[:, 2] - median_radius)
+        )
+
+        if center_spread <= 15 and radius_spread <= 20:
+            self.fixed_iris[camera_index] = (
+                median_x,
+                median_y,
+                median_radius,
+            )
+
+            self.log_msg.emit(
+                f"Camera {camera_index + 1} iris calibrated: "
+                f"center=({median_x}, {median_y}), "
+                f"radius={median_radius}"
+            )
+
+            return self.fixed_iris[camera_index]
+
+        # Samples were unstable. Start a fresh calibration window.
+        self.iris_samples[camera_index].clear()
+
+        return detected_circle
 
 
     # Applies exposure and gain settings to both cameras.
@@ -912,7 +1171,7 @@ class HardwareThread(QThread):
         DRIFT_TOLERANCE_PX = 22 # Bumped slightly so normal noise doesn't instantly wake it up
         
         STABLE_FRAMES_REQUIRED = 5
-        DRIFT_FRAMES_REQUIRED = 5
+        DRIFT_FRAMES_REQUIRED = 10
 
         # Initialize Newport USB controller.
         if not NEWPORT_AVAILABLE or USB is None:
@@ -1017,46 +1276,68 @@ class HardwareThread(QThread):
                     # ------------------------------------------
                     # Camera 1 iris and laser detection
                     # ------------------------------------------
-                    i1_x, i1_y, r1 = find_iris_grid(
-                        img1,
-                        previous_circle=self.previous_iris[0],
-                        camera_index=0,
-                    )
+                    i1_x = None
+                    i1_y = None
+                    r1 = None
+                    l1_x = None
+                    l1_y = None
 
-                    if i1_x is not None:
-                        self.previous_iris[0] = (
-                            i1_x,
-                            i1_y,
-                            r1,
+                    if self.fixed_iris[0] is None:
+                        detected_iris_1 = find_iris_grid(
+                            img1,
+                            previous_circle=self.previous_iris[0],
+                            camera_index=0,
                         )
 
+                        if (
+                            detected_iris_1 is not None
+                            and detected_iris_1[0] is not None
+                        ):
+                            self.previous_iris[0] = detected_iris_1
+
+                            calibrated_iris_1 = self.update_iris_calibration(
+                                0,
+                                detected_iris_1,
+                            )
+
+                            if calibrated_iris_1 is not None:
+                                i1_x, i1_y, r1 = calibrated_iris_1
+                    else:
+                        i1_x, i1_y, r1 = self.fixed_iris[0]
+
+                    if i1_x is not None:
                         cv2.circle(
                             img1,
-                            (i1_x, i1_y),
-                            r1,
+                            (int(i1_x), int(i1_y)),
+                            int(r1),
                             (0, 255, 0),
                             2,
                         )
 
                         cv2.circle(
                             img1,
-                            (i1_x, i1_y),
+                            (int(i1_x), int(i1_y)),
                             5,
                             (0, 0, 255),
                             -1,
                         )
 
-                    l1_x, l1_y = find_laser_center(
-                        img1,
-                        i1_x,
-                        i1_y,
-                        r1,
-                    )
+                        l1_x, l1_y = find_laser_center(
+                            img1,
+                            i1_x,
+                            i1_y,
+                            r1,
+                        )
 
                     err1_x = 0
                     err1_y = 0
 
-                    if i1_x is not None and l1_x is not None:
+                    if (
+                        i1_x is not None
+                        and i1_y is not None
+                        and l1_x is not None
+                        and l1_y is not None
+                    ):
                         self.laser_pos_update.emit(
                             0,
                             l1_x,
@@ -1077,46 +1358,68 @@ class HardwareThread(QThread):
                     # ------------------------------------------
                     # Camera 2 iris and laser detection
                     # ------------------------------------------
-                    i2_x, i2_y, r2 = find_iris_grid(
-                        img2,
-                        previous_circle=self.previous_iris[1],
-                        camera_index=1,
-                    )
+                    i2_x = None
+                    i2_y = None
+                    r2 = None
+                    l2_x = None
+                    l2_y = None
 
-                    if i2_x is not None:
-                        self.previous_iris[1] = (
-                            i2_x,
-                            i2_y,
-                            r2,
+                    if self.fixed_iris[1] is None:
+                        detected_iris_2 = find_iris_grid(
+                            img2,
+                            previous_circle=self.previous_iris[1],
+                            camera_index=1,
                         )
 
+                        if (
+                            detected_iris_2 is not None
+                            and detected_iris_2[0] is not None
+                        ):
+                            self.previous_iris[1] = detected_iris_2
+
+                            calibrated_iris_2 = self.update_iris_calibration(
+                                1,
+                                detected_iris_2,
+                            )
+
+                            if calibrated_iris_2 is not None:
+                                i2_x, i2_y, r2 = calibrated_iris_2
+                    else:
+                        i2_x, i2_y, r2 = self.fixed_iris[1]
+
+                    if i2_x is not None:
                         cv2.circle(
                             img2,
-                            (i2_x, i2_y),
-                            r2,
+                            (int(i2_x), int(i2_y)),
+                            int(r2),
                             (0, 255, 0),
                             2,
                         )
 
                         cv2.circle(
                             img2,
-                            (i2_x, i2_y),
+                            (int(i2_x), int(i2_y)),
                             5,
                             (0, 0, 255),
                             -1,
                         )
 
-                    l2_x, l2_y = find_laser_center(
-                        img2,
-                        i2_x,
-                        i2_y,
-                        r2,
-                    )
+                        l2_x, l2_y = find_laser_center(
+                            img2,
+                            i2_x,
+                            i2_y,
+                            r2,
+                        )
 
                     err2_x = 0
                     err2_y = 0
 
-                    if i2_x is not None and l2_x is not None:
+                    if (
+                        i2_x is not None
+                        and i2_y is not None
+                        and l2_x is not None
+                        and l2_y is not None
+                    ):
                         self.laser_pos_update.emit(
                             1,
                             l2_x,
@@ -1432,32 +1735,190 @@ class HardwareThread(QThread):
 # ==========================================
 
 # QLabel subclass that displays a camera feed and reports click coordinates.
+# QLabel subclass that displays a camera feed and reports
+# click coordinates in the original camera-frame coordinate system.
 class ClickableCameraView(QLabel):
     clicked = pyqtSignal(str, int, int)
 
-    # Sets up the camera display widget.
     def __init__(self, camera_name):
         super().__init__()
-        self.camera_name = camera_name
-        self.setText(f"{camera_name}\nLoading camera feed...")
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setMinimumSize(350, 300)
-        self.setStyleSheet("background-color: black; color: white; border: 2px solid gray; font-size: 16px;")
 
-    # Emits the clicked image location for manual targeting.
-    def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            x, y = int(event.position().x()), int(event.position().y())
-            self.clicked.emit(self.camera_name, x, y)
+        self.camera_name = camera_name
+
+        # Dimensions of the original OpenCV camera frame.
+        self.source_width = 0
+        self.source_height = 0
+
+        # Dimensions of the scaled pixmap currently displayed.
+        self.display_width = 0
+        self.display_height = 0
+
+        self.setText(
+            f"{camera_name}\nLoading camera feed..."
+        )
+
+        self.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+
+        self.setMinimumSize(
+            350,
+            300,
+        )
+
+        self.setCursor(
+            Qt.CursorShape.CrossCursor
+        )
+
+        self.setStyleSheet(
+            "background-color: black; "
+            "color: white; "
+            "border: 2px solid gray; "
+            "font-size: 16px;"
+        )
 
     # Converts an OpenCV frame into a scaled Qt pixmap.
     def update_image(self, cv_img):
-        rgb_image = cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB)
-        h, w, ch = rgb_image.shape
-        bytes_per_line = ch * w
-        qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qt_image)
-        self.setPixmap(pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        rgb_image = cv2.cvtColor(
+            cv_img,
+            cv2.COLOR_BGR2RGB,
+        )
+
+        height, width, channels = rgb_image.shape
+
+        # Save the original raw-frame dimensions.
+        self.source_width = width
+        self.source_height = height
+
+        bytes_per_line = channels * width
+
+        qt_image = QImage(
+            rgb_image.data,
+            width,
+            height,
+            bytes_per_line,
+            QImage.Format.Format_RGB888,
+        ).copy()
+
+        original_pixmap = QPixmap.fromImage(
+            qt_image
+        )
+
+        scaled_pixmap = original_pixmap.scaled(
+            self.contentsRect().size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        # Save the dimensions of the actual displayed image.
+        self.display_width = scaled_pixmap.width()
+        self.display_height = scaled_pixmap.height()
+
+        self.setPixmap(
+            scaled_pixmap
+        )
+
+    # Converts the QLabel click position back into raw-frame coordinates.
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+
+        if self.pixmap() is None:
+            return
+
+        if self.source_width <= 0 or self.source_height <= 0:
+            return
+
+        if self.display_width <= 0 or self.display_height <= 0:
+            return
+
+        contents = self.contentsRect()
+
+        # Because the pixmap is centered with KeepAspectRatio,
+        # there may be unused space around it.
+        x_offset = (
+            contents.x()
+            + (
+                contents.width()
+                - self.display_width
+            )
+            / 2.0
+        )
+
+        y_offset = (
+            contents.y()
+            + (
+                contents.height()
+                - self.display_height
+            )
+            / 2.0
+        )
+
+        # Convert the click into coordinates relative to
+        # the top-left corner of the displayed image.
+        displayed_x = (
+            event.position().x()
+            - x_offset
+        )
+
+        displayed_y = (
+            event.position().y()
+            - y_offset
+        )
+
+        # Ignore clicks in the unused black margin.
+        if displayed_x < 0:
+            return
+
+        if displayed_y < 0:
+            return
+
+        if displayed_x >= self.display_width:
+            return
+
+        if displayed_y >= self.display_height:
+            return
+
+        # Scale displayed-image coordinates back to the
+        # original raw camera-frame coordinates.
+        raw_x = int(
+            round(
+                displayed_x
+                * self.source_width
+                / self.display_width
+            )
+        )
+
+        raw_y = int(
+            round(
+                displayed_y
+                * self.source_height
+                / self.display_height
+            )
+        )
+
+        # Clamp to valid image coordinates.
+        raw_x = max(
+            0,
+            min(
+                raw_x,
+                self.source_width - 1,
+            ),
+        )
+
+        raw_y = max(
+            0,
+            min(
+                raw_y,
+                self.source_height - 1,
+            ),
+        )
+
+        self.clicked.emit(
+            self.camera_name,
+            raw_x,
+            raw_y,
+        )
 
 # Dialog for image saving and camera acquisition settings.
 class SettingsDialog(QDialog):
@@ -1572,8 +2033,16 @@ class AlignerApp(QMainWindow):
             },
         }
 
-        self.current_x = 0.0
-        self.current_y = 0.0
+        self.current_positions = {
+            0: {
+                "x": None,
+                "y": None,
+            },
+            1: {
+                "x": None,
+                "y": None,
+            },
+        }
         self.target_camera = None
         self.target_x = None
         self.target_y = None
@@ -1657,52 +2126,195 @@ class AlignerApp(QMainWindow):
         return tab
 
     # Creates the right-side alignment control panel.
+    # Creates the right-side alignment control panel.
+    # Creates the right-side alignment control panel.
     def create_alignment_panel(self):
         panel = QFrame()
-        panel.setFixedWidth(280)
+        panel.setFixedWidth(300)
+
         layout = QVBoxLayout()
         panel.setLayout(layout)
 
-        layout.addWidget(
-            QLabel(
-                "<b>Alignment Controls</b>",
-                alignment=Qt.AlignmentFlag.AlignCenter
-            )
+        title_label = QLabel(
+            "<b>Alignment Controls</b>",
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+        layout.addWidget(title_label)
+
+        # ------------------------------------------
+        # Live laser-position display
+        # ------------------------------------------
+        position_frame = QFrame()
+        position_frame.setFrameShape(
+            QFrame.Shape.StyledPanel
         )
 
-        self.current_position_label = QLabel()
-        self.target_position_label = QLabel()
+        position_layout = QVBoxLayout()
+        position_frame.setLayout(
+            position_layout
+        )
 
-        layout.addWidget(self.current_position_label)
-        layout.addWidget(self.target_position_label)
+        position_title = QLabel(
+            "<b>Live Laser Positions</b>",
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+        position_layout.addWidget(
+            position_title
+        )
+
+        self.cam1_position_label = QLabel(
+            "Camera 1\nX = --\nY = --"
+        )
+        self.cam1_position_label.setStyleSheet(
+            "padding: 6px; "
+            "background-color: #202020; "
+            "color: white; "
+            "border-radius: 4px;"
+        )
+
+        self.cam2_position_label = QLabel(
+            "Camera 2\nX = --\nY = --"
+        )
+        self.cam2_position_label.setStyleSheet(
+            "padding: 6px; "
+            "background-color: #202020; "
+            "color: white; "
+            "border-radius: 4px;"
+        )
+
+        position_layout.addWidget(
+            self.cam1_position_label
+        )
+
+        position_layout.addWidget(
+            self.cam2_position_label
+        )
+
+        layout.addWidget(
+            position_frame
+        )
+
+        # ------------------------------------------
+        # Selected manual target
+        # ------------------------------------------
+        self.target_position_label = QLabel()
+        self.target_position_label.setStyleSheet(
+            "padding: 6px; "
+            "background-color: #303030; "
+            "color: white; "
+            "border-radius: 4px;"
+        )
+
+        layout.addWidget(
+            self.target_position_label
+        )
 
         self.update_position_display()
         self.update_target_display()
 
-        go_button = QPushButton("Go to Target")
-        go_button.clicked.connect(self.go_to_target)
-        layout.addWidget(go_button)
+        # ------------------------------------------
+        # Control buttons
+        # ------------------------------------------
+        go_button = QPushButton(
+            "Go to Target"
+        )
+        go_button.clicked.connect(
+            self.go_to_target
+        )
+        layout.addWidget(
+            go_button
+        )
 
-        start_btn = QPushButton("Start Alignment")
-        stop_btn = QPushButton("Stop")
+        start_button = QPushButton(
+            "Start Alignment"
+        )
+        start_button.clicked.connect(
+            self.start_alignment
+        )
+        layout.addWidget(
+            start_button
+        )
 
-        start_btn.clicked.connect(self.start_alignment)
-        stop_btn.clicked.connect(self.stop_alignment)
+        stop_button = QPushButton(
+            "Stop"
+        )
+        stop_button.clicked.connect(
+            self.stop_alignment
+        )
+        layout.addWidget(
+            stop_button
+        )
 
-        layout.addWidget(start_btn)
-        layout.addWidget(stop_btn)
+        recalibrate_button = QPushButton(
+            "Recalibrate Irises"
+        )
+        recalibrate_button.clicked.connect(
+            self.recalibrate_irises
+        )
+        layout.addWidget(
+            recalibrate_button
+        )
 
-        settings_button = QPushButton("Camera Settings")
-        settings_button.clicked.connect(self.open_settings)
-        layout.addWidget(settings_button)
+        settings_button = QPushButton(
+            "Camera Settings"
+        )
+        settings_button.clicked.connect(
+            self.open_settings
+        )
+        layout.addWidget(
+            settings_button
+        )
 
         self.save_images_label = QLabel()
-        layout.addWidget(self.save_images_label)
+        layout.addWidget(
+            self.save_images_label
+        )
 
         self.update_settings_display()
 
         layout.addStretch()
+
+        # ------------------------------------------
+        # Compact log window
+        # ------------------------------------------
+        mini_log_title = QLabel(
+            "<b>Recent Activity</b>",
+            alignment=Qt.AlignmentFlag.AlignCenter,
+        )
+        layout.addWidget(
+            mini_log_title
+        )
+
+        self.mini_log_box = QTextEdit()
+        self.mini_log_box.setReadOnly(
+            True
+        )
+        self.mini_log_box.setFixedHeight(
+            130
+        )
+        self.mini_log_box.setStyleSheet(
+            "background-color: #181818; "
+            "color: #dddddd; "
+            "font-family: Consolas; "
+            "font-size: 10px;"
+        )
+
+        layout.addWidget(
+            self.mini_log_box
+        )
+
         return panel
+    
+    def recalibrate_irises(self):
+        self.hw_thread.recalibrate_irises()
+
+        self.set_status_message(
+            "Recalibrating iris centers..."
+        )
+
+        self.log(
+            "Iris recalibration requested."
+        )
 
     # Opens the settings dialog and applies accepted changes.
     def open_settings(self):
@@ -1777,10 +2389,16 @@ class AlignerApp(QMainWindow):
         elif cam_index == 1: self.cam2_view.update_image(img_data)
 
     # Updates the displayed laser coordinate.
-    def update_current_position(self, cam_idx, x, y):
-        self.current_x = x
-        self.current_y = y
-        self.update_position_display(f"Camera {cam_idx + 1}")
+    def update_current_position(
+        self,
+        cam_idx,
+        x,
+        y,
+    ):
+        self.current_positions[cam_idx]["x"] = x
+        self.current_positions[cam_idx]["y"] = y
+
+        self.update_position_display()
 
     # Stores a clicked target point for manual alignment.
     def set_target_position(self, camera_name, x, y):
@@ -1804,8 +2422,38 @@ class AlignerApp(QMainWindow):
         self.hw_thread.execute_manual_move(cam_idx, self.target_x, self.target_y)
 
     # Refreshes the current-position label.
-    def update_position_display(self, active_cam="None"):
-        self.current_position_label.setText(f"Laser Tracking ({active_cam}):\nX = {self.current_x}\nY = {self.current_y}")
+    def update_position_display(self):
+        cam1_x = self.current_positions[0]["x"]
+        cam1_y = self.current_positions[0]["y"]
+
+        cam2_x = self.current_positions[1]["x"]
+        cam2_y = self.current_positions[1]["y"]
+
+        if cam1_x is None:
+            cam1_x_text = "--"
+            cam1_y_text = "--"
+        else:
+            cam1_x_text = str(cam1_x)
+            cam1_y_text = str(cam1_y)
+
+        if cam2_x is None:
+            cam2_x_text = "--"
+            cam2_y_text = "--"
+        else:
+            cam2_x_text = str(cam2_x)
+            cam2_y_text = str(cam2_y)
+
+        self.cam1_position_label.setText(
+            "Camera 1 Laser\n"
+            f"X = {cam1_x_text}\n"
+            f"Y = {cam1_y_text}"
+        )
+
+        self.cam2_position_label.setText(
+            "Camera 2 Laser\n"
+            f"X = {cam2_x_text}\n"
+            f"Y = {cam2_y_text}"
+        )
 
     # Refreshes the selected-target label.
     def update_target_display(self):
@@ -1842,7 +2490,16 @@ class AlignerApp(QMainWindow):
             f"Camera 1: {cam1_exposure_ms:.1f} ms, gain {cam1_gain:.1f}\n"
             f"Camera 2: {cam2_exposure_ms:.1f} ms, gain {cam2_gain:.1f}"
         )
+    def recalibrate_irises(self):
+        self.hw_thread.recalibrate_irises()
 
+        self.set_status_message(
+            "Recalibrating iris centers..."
+        )
+
+        self.log(
+            "Iris recalibration requested."
+        )
     # Resets lock states and starts automatic alignment.
     def start_alignment(self):
 
@@ -1875,9 +2532,49 @@ class AlignerApp(QMainWindow):
 
     # Writes a message to both the GUI log and terminal.
     def log(self, msg):
+        timestamp = time.strftime(
+            "%H:%M:%S"
+        )
+
+        formatted_message = (
+            f"[{timestamp}] {msg}"
+        )
+
         if hasattr(self, "log_box"):
-            self.log_box.append(msg)
-        print(msg)
+            self.log_box.append(
+                formatted_message
+            )
+
+        if hasattr(self, "mini_log_box"):
+            self.mini_log_box.append(
+                formatted_message
+            )
+
+            # Keep the compact box focused on recent messages.
+            document = self.mini_log_box.document()
+
+            while document.blockCount() > 8:
+                cursor = self.mini_log_box.textCursor()
+                cursor.movePosition(
+                    cursor.MoveOperation.Start
+                )
+                cursor.select(
+                    cursor.SelectionType.BlockUnderCursor
+                )
+                cursor.removeSelectedText()
+                cursor.deleteChar()
+
+            scrollbar = (
+                self.mini_log_box.verticalScrollBar()
+            )
+
+            scrollbar.setValue(
+                scrollbar.maximum()
+            )
+
+        print(
+            formatted_message
+        )
 
     # Ensures hardware is closed before the GUI exits.
     def closeEvent(self, event):
